@@ -53,7 +53,7 @@ interface MUNDocument {
 
 const INIT_MESSAGE: ChatMessage = {
   role: "model",
-  parts: [{ text: "Welcome to MUN Assistant Pro. I see you are preparing for SPECPOL with the agenda on the Peaceful Uses of Outer Space and Mars. I can help you draft your opening speech, research country policies on space militarization, summarize the Outer Space Treaty, or clarify MUN procedures. What country are you representing?" }]
+  parts: [{ text: "Welcome to MUN Assistant Pro. I'm here to help you prepare for your upcoming Model UN conference. I can help you draft your opening speech, research country policies, summarize treaties, or clarify MUN procedures. What committee and country are you representing?" }]
 };
 
 export default function App() {
@@ -174,9 +174,9 @@ export default function App() {
   const messages = activeThread?.messages || [];
 
   const SUGGESTED_PROMPTS = [
-    "What are the key provisions of the 1967 Outer Space Treaty?",
-    "Draft an opening speech for SPECPOL on the militarization of Mars.",
-    "What is the US and China's stance on territorial appropriation in space?",
+    "What are the key priorities of my country for this agenda?",
+    "Draft an opening speech for my committee.",
+    "Summarize the recent UN actions on this topic.",
     "How do I raise a point of information during the committee?"
   ];
 
@@ -1147,18 +1147,18 @@ export default function App() {
                   <section>
                     <h3 className="font-semibold text-slate-900 mb-3 flex items-center gap-2">
                       <span className="w-1.5 h-6 bg-purple-500 rounded-full"></span>
-                      Motions (SPECPOL Examples)
+                      Motions (Examples)
                     </h3>
                     <div className="space-y-4">
                       <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
                         <strong className="block text-slate-900 mb-1">Moderated Caucus</strong>
                         <p className="text-slate-600 text-sm mb-2">Formal debate with a specific topic, total time, and speaking time.</p>
-                        <div className="bg-purple-50 p-2 text-purple-700 rounded-lg text-sm font-mono">"The delegate of [Country] motions for a 10-minute moderated caucus with 1 minute speaking time, on the topic of 'Regulating Private Mining on Mars'."</div>
+                        <div className="bg-purple-50 p-2 text-purple-700 rounded-lg text-sm font-mono">"The delegate of [Country] motions for a 10-minute moderated caucus with 1 minute speaking time, on the topic of 'Funding approaches for the refugee crisis'."</div>
                       </div>
                       <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
                         <strong className="block text-slate-900 mb-1">Unmoderated Caucus</strong>
                         <p className="text-slate-600 text-sm mb-2">Informal debate to form blocs and write resolutions.</p>
-                        <div className="bg-purple-50 p-2 text-purple-700 rounded-lg text-sm font-mono">"Motion for a 15-minute unmoderated caucus to draft working papers concerning the Outer Space Treaty."</div>
+                        <div className="bg-purple-50 p-2 text-purple-700 rounded-lg text-sm font-mono">"Motion for a 15-minute unmoderated caucus to draft working papers regarding committee agenda 1."</div>
                       </div>
                       <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
                         <strong className="block text-slate-900 mb-1">Motion to Introduce a Draft Resolution</strong>
