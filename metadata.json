@@ -1,0 +1,8 @@
+{
+  "name": "MUN Assistant Pro",
+  "description": "An AI agent specifically built for Model United Nations (MUN) delegates. Provides instant answers to MUN rules, country policies, and can summarize research papers and historical documents.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
