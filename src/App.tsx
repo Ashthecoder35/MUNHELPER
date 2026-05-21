@@ -16,6 +16,37 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+async function robustFetch(input: RequestInfo | URL, init?: RequestInit, retries = 15, delayMs = 2000): Promise<Response> {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const response = await fetch(input, init);
+      const contentType = response.headers.get("content-type");
+      const isHTML = contentType && contentType.includes("text/html");
+      const isServerError = response.status >= 500;
+
+      if (isServerError || isHTML) {
+        if (i < retries - 1) {
+          console.warn(`robustFetch detected retriable response (status: ${response.status}, isHTML: ${isHTML}) for ${input} (attempt ${i + 1}/${retries}). Retrying in ${delayMs}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+          continue;
+        } else {
+          throw new Error("The server is still starting up or unavailable. Please try your request again in a few moments.");
+        }
+      }
+      return response;
+    } catch (err: any) {
+      if (i < retries - 1) {
+        console.warn(`robustFetch failed for ${input} (attempt ${i + 1}/${retries}). Retrying in ${delayMs}ms...`, err);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        continue;
+      }
+      // Provide a more user-friendly error message
+      throw new Error(err.message || "Failed to reach the server. Please check your connection and try again.");
+    }
+  }
+  throw new Error("Failed to connect to the server after multiple attempts.");
+}
+
 interface ChatPart {
   text?: string;
   inlineData?: {
@@ -41,6 +72,8 @@ interface DelegateProfile {
   country: string;
   speakingStyle: string;
   policyPoints: string;
+  committee: string;
+  agenda: string;
 }
 
 interface MUNDocument {
@@ -50,6 +83,57 @@ interface MUNDocument {
   content: string;
   updatedAt: number;
 }
+
+interface GlobalDoc {
+  id: string;
+  country: string;
+  type: "position_paper" | "gsl" | "resolution";
+  content: string;
+  committee: string;
+  agenda: string;
+}
+
+const COMMITTEES = [
+  {
+    name: "Special Political and Decolonization Committee (SPECPOL)",
+    agenda: "Examining International Cooperation in the Peaceful Uses of Outer Space & Preventing the Militarization of Mars"
+  },
+  {
+    name: "Disarmament and International Security Committee (DISEC)",
+    agenda: "Combating the Proliferation of Cyberwarfare Capabilities & AI-driven Weapons Systems"
+  },
+  {
+    name: "Economic and Financial Committee (ECOFIN)",
+    agenda: "Addressing Sovereign Debt Crises in Developing Nations and Re-evaluating the Global Financial Agenda"
+  },
+  {
+    name: "Social, Humanitarian and Cultural Committee (SOCHUM)",
+    agenda: "Protecting the Human Rights of Climate Displaced Persons and Refugee Crisis Mitigation"
+  },
+  {
+    name: "United Nations Security Council (UNSC)",
+    agenda: "Maintaining Peace and Addressing Escalating Geopolitical Tensions in the South China Sea"
+  },
+  {
+    name: "Custom Committee...",
+    agenda: ""
+  }
+];
+
+const REPOSITORY_COUNTRIES = [
+  "United States",
+  "China",
+  "Russian Federation",
+  "United Kingdom",
+  "France",
+  "India",
+  "Saudi Arabia",
+  "Brazil",
+  "Japan",
+  "South Africa",
+  "Egypt",
+  "Germany"
+];
 
 const INIT_MESSAGE: ChatMessage = {
   role: "model",
@@ -94,9 +178,24 @@ export default function App() {
   const [profile, setProfile] = useState<DelegateProfile>(() => {
     const saved = localStorage.getItem("mun_profile");
     if (saved) {
-      try { return JSON.parse(saved); } catch(e) {}
+      try {
+        const parsed = JSON.parse(saved);
+        return {
+          country: parsed.country || "",
+          speakingStyle: parsed.speakingStyle || "",
+          policyPoints: parsed.policyPoints || "",
+          committee: parsed.committee || "Special Political and Decolonization Committee (SPECPOL)",
+          agenda: parsed.agenda || "Examining International Cooperation in the Peaceful Uses of Outer Space & Preventing the Militarization of Mars"
+        };
+      } catch(e) {}
     }
-    return { country: "", speakingStyle: "", policyPoints: "" };
+    return { 
+      country: "", 
+      speakingStyle: "", 
+      policyPoints: "",
+      committee: "Special Political and Decolonization Committee (SPECPOL)",
+      agenda: "Examining International Cooperation in the Peaceful Uses of Outer Space & Preventing the Militarization of Mars"
+    };
   });
   const [documents, setDocuments] = useState<MUNDocument[]>(() => {
     const saved = localStorage.getItem("mun_documents");
@@ -107,6 +206,19 @@ export default function App() {
   });
   const [editingDocId, setEditingDocId] = useState<string | null>(null);
   const [docsModalOpen, setDocsModalOpen] = useState(false);
+  
+  // Design states for Global Country Documents Repository
+  const [activeDocTab, setActiveDocTab] = useState<"my" | "global">("my");
+  const [selectedGlobalCountry, setSelectedGlobalCountry] = useState("United States");
+  const [selectedGlobalDocType, setSelectedGlobalDocType] = useState<"position_paper" | "gsl" | "resolution">("position_paper");
+  const [isSimulatingGlobalDoc, setIsSimulatingGlobalDoc] = useState(false);
+  const [globalDocuments, setGlobalDocuments] = useState<GlobalDoc[]>(() => {
+    const saved = localStorage.getItem("mun_global_documents");
+    if (saved) {
+      try { return JSON.parse(saved); } catch(e) {}
+    }
+    return [];
+  });
 
   const [chitDraft, setChitDraft] = useState("");
   const [refinedChit, setRefinedChit] = useState("");
@@ -149,6 +261,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("mun_documents", JSON.stringify(documents));
   }, [documents]);
+
+  useEffect(() => {
+    localStorage.setItem("mun_global_documents", JSON.stringify(globalDocuments));
+  }, [globalDocuments]);
 
   useEffect(() => {
     if (isSessionMode) {
@@ -240,17 +356,12 @@ export default function App() {
     if (!chitDraft.trim()) return;
     setIsRefining(true);
     try {
-      const res = await fetch("/api/refine-chit", {
+      const res = await robustFetch("/api/refine-chit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ draft: chitDraft, profile })
       });
       if (!res.ok) throw new Error("Failed to refine chit");
-      
-      const contentType = res.headers.get("content-type");
-      if (contentType && contentType.includes("text/html")) {
-        throw new Error("Server returned HTML. The dev server might be restarting.");
-      }
       
       const data = await res.json();
       setRefinedChit(data.text);
@@ -264,6 +375,42 @@ export default function App() {
 
   const handleUpdateDocContent = (id: string, content: string) => {
     setDocuments(prev => prev.map(doc => doc.id === id ? { ...doc, content, updatedAt: Date.now() } : doc));
+  };
+
+  const handleSimulateGlobalDoc = async (countryName: string, type: "position_paper" | "gsl" | "resolution") => {
+    setIsSimulatingGlobalDoc(true);
+    try {
+      const res = await robustFetch("/api/simulate-country-document", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          country: countryName,
+          committee: profile.committee,
+          agenda: profile.agenda,
+          type
+        })
+      });
+      if (!res.ok) throw new Error("Simulation failed");
+      const data = await res.json();
+      
+      const newGlobalDoc: GlobalDoc = {
+        id: `${countryName}_${type}`,
+        country: countryName,
+        type,
+        content: data.text,
+        committee: profile.committee,
+        agenda: profile.agenda
+      };
+      
+      setGlobalDocuments(prev => {
+        const filtered = prev.filter(d => d.id !== newGlobalDoc.id);
+        return [newGlobalDoc, ...filtered];
+      });
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsSimulatingGlobalDoc(false);
+    }
   };
 
   const handleDeleteDoc = (id: string, e: React.MouseEvent) => {
@@ -316,6 +463,303 @@ export default function App() {
     }
   };
 
+  const renderDocumentSidebar = (isFullLayout: boolean = false) => {
+    return (
+      <div className="flex flex-col h-full overflow-hidden">
+        {/* Toggle Tabs */}
+        <div className="flex border-b border-slate-200 shrink-0 bg-slate-100">
+          <button 
+            onClick={() => setActiveDocTab("my")}
+            className={cn(
+              "flex-1 py-2.5 text-xs font-semibold text-center border-b-2 transition-all",
+              activeDocTab === "my" ? "border-blue-600 text-blue-600 bg-white" : "border-transparent text-slate-500 hover:text-slate-800"
+            )}
+          >
+            My Drafts
+          </button>
+          <button 
+            onClick={() => setActiveDocTab("global")}
+            className={cn(
+              "flex-1 py-2.5 text-xs font-semibold text-center border-b-2 transition-all",
+              activeDocTab === "global" ? "border-blue-600 text-blue-600 bg-white" : "border-transparent text-slate-500 hover:text-slate-800"
+            )}
+          >
+            Global Archives
+          </button>
+        </div>
+
+        {activeDocTab === "my" ? (
+          <div className="flex-1 flex flex-col overflow-hidden">
+            <div className="p-4 border-b border-slate-200 flex flex-col gap-2 shrink-0">
+              <button 
+                onClick={() => {
+                  const newDoc: MUNDocument = {
+                    id: Date.now().toString(),
+                    title: "Untitled Document",
+                    type: "other",
+                    content: "",
+                    updatedAt: Date.now()
+                  };
+                  setDocuments(prev => [newDoc, ...prev]);
+                  setEditingDocId(newDoc.id);
+                }}
+                className="w-full bg-white border border-slate-200 hover:border-slate-300 text-slate-700 p-2.5 rounded-lg flex items-center justify-center gap-2 transition-all shadow-sm font-medium text-sm"
+              >
+                <Plus size={16} />
+                <span>New Document</span>
+              </button>
+              <button 
+                onClick={() => {
+                  const templateContent = `<h3><b>Preambulatory Clauses</b></h3><p><em>Recalling</em> previous resolutions on this matter,</p><p><em>Deeply concerned</em> by the recent developments,</p><p><em>Acknowledging</em> the efforts of member states,</p><br/><h3><b>Operative Clauses</b></h3><p>1. <u>Encourages</u> member states to...</p><p>2. <u>Requests</u> immediate action to...</p><p>3. <u>Calls upon</u> the United Nations to...</p>`;
+                  const newDoc: MUNDocument = {
+                    id: Date.now().toString(),
+                    title: "Draft Resolution",
+                    type: "other",
+                    content: templateContent,
+                    updatedAt: Date.now()
+                  };
+                  setDocuments(prev => [newDoc, ...prev]);
+                  setEditingDocId(newDoc.id);
+                }}
+                className="w-full bg-blue-50 border border-blue-200 hover:bg-blue-100 text-blue-700 p-2.5 rounded-lg flex items-center justify-center gap-1.5 transition-all shadow-sm font-medium text-xs sm:text-sm"
+              >
+                <LayoutTemplate size={16} />
+                <span>Resolution Builder</span>
+              </button>
+            </div>
+            
+            <div className="flex-1 overflow-y-auto p-3 space-y-1">
+              {documents.length === 0 ? (
+                <p className="text-xs text-center text-slate-400 mt-4">Library is empty.</p>
+              ) : (
+                documents.map(doc => (
+                  <div 
+                    key={doc.id}
+                    onClick={() => {
+                      setEditingDocId(doc.id);
+                    }}
+                    className={cn(
+                      "p-3 rounded-xl cursor-pointer transition-all border group",
+                      editingDocId === doc.id ? "bg-white shadow-sm border-blue-200 text-slate-800" : "bg-transparent border-transparent hover:bg-slate-100/80 text-slate-600"
+                    )}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                       <h4 className="text-sm font-medium truncate">{doc.title}</h4>
+                       <button 
+                         onClick={(e) => handleDeleteDoc(doc.id, e)}
+                         className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-500 transition-opacity"
+                       >
+                         <Trash2 size={14} />
+                       </button>
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-1 opacity-70">{new Date(doc.updatedAt).toLocaleDateString()}</p>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
+            <div className="p-3.5 border-b border-slate-200 flex flex-col gap-1.5 shrink-0 bg-white">
+              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Select Delegation</label>
+              <select
+                value={selectedGlobalCountry}
+                onChange={(e) => setSelectedGlobalCountry(e.target.value)}
+                className="w-full bg-white outline-none px-2 py-2 rounded-lg border border-slate-200 text-slate-700 text-xs font-semibold focus:border-blue-400 focus:ring-1 focus:ring-blue-400 transition"
+              >
+                {REPOSITORY_COUNTRIES.map(country => (
+                  <option key={country} value={country}>{country}</option>
+                ))}
+              </select>
+            </div>
+            
+            <div className="flex-1 p-3 flex flex-col gap-2 overflow-y-auto bg-slate-50">
+              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider px-1">Committees Document</label>
+              
+              {(["position_paper", "gsl", "resolution"] as const).map(dt => {
+                const hasDoc = globalDocuments.some(d => d.country === selectedGlobalCountry && d.type === dt && d.committee === profile.committee && d.agenda === profile.agenda);
+                const isSelected = selectedGlobalDocType === dt;
+                return (
+                  <button
+                    key={dt}
+                    onClick={() => setSelectedGlobalDocType(dt)}
+                    className={cn(
+                      "w-full text-left p-2.5 rounded-xl flex flex-col gap-0.5 transition-all border",
+                      isSelected 
+                        ? "bg-white shadow-sm border-blue-200" 
+                        : "bg-transparent border-transparent hover:bg-slate-100/80"
+                    )}
+                  >
+                    <div className="flex items-center justify-between w-full">
+                      <span className={cn(
+                        "text-xs font-semibold capitalize",
+                        isSelected ? "text-blue-700" : "text-slate-700"
+                      )}>
+                        {dt === "position_paper" ? "Position Paper" : dt === "gsl" ? "GSL Speech" : "Resolution Clause"}
+                      </span>
+                      {hasDoc ? (
+                        <span className="bg-emerald-100/75 text-emerald-800 text-[8px] font-bold px-1.5 py-0.5 rounded-full">DRAFTED</span>
+                      ) : (
+                        <span className="bg-slate-200/75 text-slate-500 text-[8px] font-semibold px-1.5 py-0.5 rounded-full">NOT READY</span>
+                      )}
+                    </div>
+                    <p className="text-[10px] text-slate-400 truncate w-full">
+                      {dt === "position_paper" ? `National policy statement` : dt === "gsl" ? `Speakers List format` : `Sponsoring working clauses`}
+                    </p>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderDocumentEditor = () => {
+    if (activeDocTab === "global") {
+      const activeGlobalDoc = globalDocuments.find(
+        d => d.country === selectedGlobalCountry && d.type === selectedGlobalDocType && d.committee === profile.committee && d.agenda === profile.agenda
+      );
+
+      if (activeGlobalDoc) {
+        return (
+          <div className="flex flex-col h-full absolute inset-0 bg-white">
+            <div className="px-12 pt-8 pb-4 shrink-0 flex items-center justify-between border-b border-slate-100 bg-white">
+              <div>
+                <h3 className="text-xl font-display font-semibold text-slate-900 capitalize">
+                  {selectedGlobalCountry} &mdash; {selectedGlobalDocType === "position_paper" ? "Position Paper" : selectedGlobalDocType === "gsl" ? "GSL Speech" : "Clause Draft"}
+                </h3>
+                <p className="text-xs text-slate-500 mt-1 leading-normal">
+                  Topic: <b>{profile.agenda}</b> &bull; Committee: {profile.committee}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button 
+                  onClick={() => {
+                    const newLocalDoc: MUNDocument = {
+                      id: Date.now().toString(),
+                      title: `${selectedGlobalCountry} (${selectedGlobalDocType === 'position_paper' ? 'Position Paper' : selectedGlobalDocType === 'gsl' ? 'GSL Speech' : 'Clauses'})`,
+                      type: selectedGlobalDocType === 'gsl' ? 'gsl' : 'other',
+                      content: activeGlobalDoc.content,
+                      updatedAt: Date.now()
+                    };
+                    setDocuments(prev => [newLocalDoc, ...prev]);
+                    setEditingDocId(newLocalDoc.id);
+                    setActiveDocTab("my");
+                  }}
+                  className="bg-blue-50 text-blue-700 hover:bg-blue-100 px-3.5 py-2 rounded-xl text-xs sm:text-sm font-semibold transition flex items-center gap-1.5"
+                >
+                  <Plus size={16} />
+                  <span>Import into My Drafts</span>
+                </button>
+              </div>
+            </div>
+            
+            <div className="flex-1 overflow-y-auto bg-slate-50/50 p-6 sm:p-10">
+              <div className="max-w-3xl mx-auto bg-white rounded-2xl border border-slate-200/50 shadow-sm p-8 sm:p-12 min-h-[500px]">
+                <div className="prose prose-slate max-w-none text-slate-800 text-[14px] sm:text-[15px] leading-relaxed ql-editor" dangerouslySetInnerHTML={{ __html: activeGlobalDoc.content }} />
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div className="flex-1 flex flex-col items-center justify-center p-6 text-center bg-slate-50 absolute inset-0">
+          <div className="max-w-md bg-white p-8 rounded-2xl shadow-sm border border-slate-200/60 transition-all">
+            <div className="bg-blue-100 text-blue-600 w-14 h-14 rounded-2xl flex items-center justify-center mx-auto mb-5 shadow-sm">
+              <Sparkles size={26} className={isSimulatingGlobalDoc ? "animate-pulse" : ""} />
+            </div>
+            <h3 className="text-lg font-semibold text-slate-900 mb-1.5 capitalize">Simulate {selectedGlobalCountry}'s document</h3>
+            <p className="text-xs text-slate-500 mb-6 leading-relaxed">
+              The AI simulator will research the real-world foreign policies, trade ties, alliances, and actions of <b>{selectedGlobalCountry}</b> and produce a realistic <b>{selectedGlobalDocType === "position_paper" ? "Position Paper" : selectedGlobalDocType === "gsl" ? "General Speakers List Speech" : "Resolution Clause"}</b> for the <b>{profile.committee}</b>.
+            </p>
+            
+            {isSimulatingGlobalDoc ? (
+              <div className="flex flex-col items-center gap-2.5">
+                <Loader2 className="animate-spin text-blue-600" size={24} />
+                <span className="text-xs font-semibold text-slate-500 animate-pulse">Running diplomatic policy sim...</span>
+              </div>
+            ) : (
+              <button
+                onClick={() => handleSimulateGlobalDoc(selectedGlobalCountry, selectedGlobalDocType)}
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white py-2.5 px-4 rounded-xl font-medium transition active:scale-95 shadow-sm text-sm"
+              >
+                Draft via AI Simulator &rarr;
+              </button>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // Default 'my' document editor view
+    if (editingDocId) {
+      const doc = documents.find(d => d.id === editingDocId);
+      return (
+        <div className="flex flex-col h-full absolute inset-0">
+          <div className="px-12 pt-8 pb-4 shrink-0 flex items-center justify-between border-b border-slate-100 bg-white">
+            <input 
+              className="text-2xl font-display font-semibold text-slate-900 bg-transparent border-none focus:ring-0 p-0 placeholder:text-slate-300 outline-none flex-1 min-w-0"
+              value={doc?.title || ""}
+              placeholder="Untitled Document"
+              onChange={(e) => {
+                const val = e.target.value;
+                setDocuments(prev => prev.map(d => d.id === editingDocId ? { ...d, title: val } : d));
+              }}
+            />
+            <div className="flex items-center gap-1 shrink-0 ml-4">
+              <button 
+                onClick={() => handleDownloadDoc(editingDocId)}
+                className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors flex items-center gap-1.5 text-sm font-medium"
+                title="Download as HTML"
+              >
+                <Download size={16} />
+                <span className="hidden sm:inline">Download</span>
+              </button>
+              <button 
+                onClick={() => handleShareDoc(editingDocId)}
+                className="p-2 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors flex items-center gap-1.5 text-sm font-medium"
+                title="Share or Copy text"
+              >
+                <Share2 size={16} />
+                <span className="hidden sm:inline">Share</span>
+              </button>
+            </div>
+          </div>
+          <div className="flex-1 overflow-y-auto p-4 px-12">
+            <div className="max-w-4xl mx-auto h-full pb-32">
+              <ReactQuill 
+                theme="snow"
+                value={doc?.content || ""}
+                onChange={(val) => handleUpdateDocContent(editingDocId, val)}
+                placeholder="Start drafting here... Remember, AI is not allowed during debate."
+                modules={{
+                  toolbar: [
+                    [{'header': [1, 2, 3, false]}],
+                    ['bold', 'italic', 'underline', 'strike'],
+                    [{'list': 'ordered'}, {'list': 'bullet'}],
+                    [{'align': []}],
+                    ['clean']
+                  ]
+                }}
+                className="h-full rounded-xl border border-transparent hover:border-slate-100 transition-colors [&_.ql-toolbar]:border-none [&_.ql-toolbar]:bg-slate-50 [&_.ql-toolbar]:rounded-t-xl [&_.ql-container]:border-none [&_.ql-container]:text-[15px] [&_.ql-editor]:min-h-[400px] [&_.ql-editor]:font-sans [&_.ql-editor]:text-slate-800"
+              />
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="h-full flex flex-col items-center justify-center text-slate-400 absolute inset-0 bg-slate-50/50">
+        <FileText size={48} className="opacity-20 mb-4" />
+        <p className="text-sm font-medium text-slate-500">Select a document from the library to edit.</p>
+      </div>
+    );
+  };
+
   const handleRopSearch = async (e?: React.FormEvent) => {
     e?.preventDefault();
     if (!ropSearchQuery.trim()) {
@@ -324,17 +768,12 @@ export default function App() {
     }
     setIsSearchingRop(true);
     try {
-      const res = await fetch("/api/search-rop", {
+      const res = await robustFetch("/api/search-rop", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: ropSearchQuery })
       });
       if (!res.ok) throw new Error("Search failed");
-      
-      const contentType = res.headers.get("content-type");
-      if (contentType && contentType.includes("text/html")) {
-        throw new Error("Server returned HTML. The dev server might be restarting.");
-      }
       
       const data = await res.json();
       setRopSearchResult(data.text);
@@ -418,23 +857,30 @@ export default function App() {
         formData.append("files", file);
       });
 
-      const response = await fetch("/api/chat", {
+      const response = await robustFetch("/api/chat", {
         method: "POST",
         body: formData,
       });
 
       if (!response.ok) {
-        let errData = {};
-        const contentType = response.headers.get("content-type");
-        if (contentType && !contentType.includes("text/html")) {
-          errData = await response.json().catch(() => ({}));
+        let errMessage = "An error occurred";
+        try {
+          const contentType = response.headers.get("content-type");
+          if (contentType && contentType.includes("application/json")) {
+            const errData = await response.json();
+            errMessage = errData.error || errData.message || response.statusText;
+          } else {
+            const text = await response.text();
+            if (text.includes("<!DOCTYPE html>") || text.includes("<html")) {
+              errMessage = `Server returned HTML (Status ${response.status}). The server might be misconfigured or restarting.`;
+            } else {
+              errMessage = text.substring(0, 100) || `Error ${response.status}`;
+            }
+          }
+        } catch (e) {
+          errMessage = `Request failed with status ${response.status}`;
         }
-        throw new Error((errData as any).error || `Server error: ${response.status}`);
-      }
-
-      const contentType = response.headers.get("content-type");
-      if (contentType && contentType.includes("text/html")) {
-        throw new Error("Server returned HTML. The dev server might be restarting or proxy failed.");
+        throw new Error(errMessage);
       }
 
       const data = await response.json();
@@ -491,6 +937,25 @@ export default function App() {
     setIsTimerRunning(false);
   };
 
+  const handleCommitteeChange = (selectedName: string) => {
+    if (selectedName === "Custom Committee...") {
+      setProfile(prev => ({
+        ...prev,
+        committee: "Custom Committee",
+        agenda: ""
+      }));
+    } else {
+      const match = COMMITTEES.find(c => c.name === selectedName);
+      if (match) {
+        setProfile(prev => ({
+          ...prev,
+          committee: match.name,
+          agenda: match.agenda
+        }));
+      }
+    }
+  };
+
   const profileModalJSX = (
     <AnimatePresence>
       {profileOpen && (
@@ -534,6 +999,45 @@ export default function App() {
                 />
                 <span className="text-xs text-slate-500">The agent will research this country's past resolutions.</span>
               </div>
+
+              <div className="flex flex-col gap-1.5">
+                <label className="text-sm font-semibold text-slate-700">Committee</label>
+                <select
+                  value={!COMMITTEES.some(c => c.name === profile.committee && c.name !== "Custom Committee...") ? "Custom Committee..." : profile.committee}
+                  onChange={e => handleCommitteeChange(e.target.value)}
+                  className="w-full bg-white outline-none px-3 py-2.5 rounded-lg border border-slate-200 text-slate-800 text-sm focus:border-blue-400 focus:ring-1 focus:ring-blue-400 transition"
+                >
+                  {COMMITTEES.map(c => (
+                    <option key={c.name} value={c.name}>{c.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              {!COMMITTEES.some(c => c.name === profile.committee && c.name !== "Custom Committee...") && (
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-sm font-semibold text-slate-700">Custom Committee Name</label>
+                  <input 
+                    type="text" 
+                    placeholder="e.g. UN Women, UNEP..." 
+                    value={profile.committee === "Custom Committee" ? "" : profile.committee}
+                    onChange={e => setProfile({ ...profile, committee: e.target.value })}
+                    className="w-full bg-white outline-none px-3 py-2.5 rounded-lg border border-slate-200 text-slate-800 text-sm focus:border-blue-400 focus:ring-1 focus:ring-blue-400 transition"
+                  />
+                </div>
+              )}
+
+              <div className="flex flex-col gap-1.5">
+                <label className="text-sm font-semibold text-slate-700">Committee Agenda / Topic</label>
+                <textarea 
+                  placeholder="e.g. The issue of microplastics in oceans..." 
+                  rows={2}
+                  value={profile.agenda}
+                  onChange={e => setProfile({ ...profile, agenda: e.target.value })}
+                  className="w-full resize-none bg-white outline-none px-3 py-2.5 rounded-lg border border-slate-200 text-slate-800 text-sm focus:border-blue-400 focus:ring-1 focus:ring-blue-400 transition"
+                />
+                <span className="text-xs text-slate-500">The AI assistant, speeches, and chits will dynamically align with this theme.</span>
+              </div>
+
               <div className="flex flex-col gap-1.5">
                 <label className="text-sm font-semibold text-slate-700">Speaking Style</label>
                 <input 
@@ -648,132 +1152,12 @@ export default function App() {
         <div className="flex-1 flex overflow-hidden">
           {/* Left Sidebar: Document Library */}
           <div className="w-64 border-r border-slate-200 bg-slate-50 flex flex-col shrink-0">
-            <div className="p-4 border-b border-slate-200 flex flex-col gap-2">
-              <button 
-                onClick={() => {
-                  const newDoc: MUNDocument = {
-                    id: Date.now().toString(),
-                    title: "Untitled Document",
-                    type: "other",
-                    content: "",
-                    updatedAt: Date.now()
-                  };
-                  setDocuments(prev => [newDoc, ...prev]);
-                  setEditingDocId(newDoc.id);
-                }}
-                className="w-full bg-white border border-slate-200 hover:border-slate-300 text-slate-700 p-2.5 rounded-lg flex items-center justify-center gap-2 transition-all shadow-sm font-medium text-sm"
-              >
-                <Plus size={16} />
-                <span>New Document</span>
-              </button>
-              <button 
-                onClick={() => {
-                  const templateContent = `<h3><b>Preambulatory Clauses</b></h3><p><em>Recalling</em> previous resolutions on this matter,</p><p><em>Deeply concerned</em> by the recent developments,</p><p><em>Acknowledging</em> the efforts of member states,</p><br/><h3><b>Operative Clauses</b></h3><p>1. <u>Encourages</u> member states to...</p><p>2. <u>Requests</u> immediate action to...</p><p>3. <u>Calls upon</u> the United Nations to...</p>`;
-                  const newDoc: MUNDocument = {
-                    id: Date.now().toString(),
-                    title: "Draft Resolution",
-                    type: "other",
-                    content: templateContent,
-                    updatedAt: Date.now()
-                  };
-                  setDocuments(prev => [newDoc, ...prev]);
-                  setEditingDocId(newDoc.id);
-                }}
-                className="w-full bg-blue-50 border border-blue-200 hover:bg-blue-100 text-blue-700 p-2.5 rounded-lg flex items-center justify-center gap-2 transition-all shadow-sm font-medium text-sm"
-              >
-                <LayoutTemplate size={16} />
-                <span>Resolution Builder</span>
-              </button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-3 space-y-1">
-              {documents.length === 0 ? (
-                <p className="text-xs text-center text-slate-400 mt-4">No documents</p>
-              ) : (
-                documents.map(doc => (
-                  <div 
-                    key={doc.id}
-                    onClick={() => setEditingDocId(doc.id)}
-                    className={cn(
-                      "p-3 rounded-xl cursor-pointer transition-all border group",
-                      editingDocId === doc.id ? "bg-white shadow-sm border-slate-200 text-slate-800" : "bg-transparent border-transparent hover:bg-slate-100/80 text-slate-600"
-                    )}
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                       <h4 className="text-sm font-medium truncate">{doc.title}</h4>
-                       <button 
-                         onClick={(e) => handleDeleteDoc(doc.id, e)}
-                         className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-500 transition-opacity"
-                       >
-                         <Trash2 size={14} />
-                       </button>
-                    </div>
-                    <p className="text-[10px] text-slate-400 mt-1 opacity-70">{new Date(doc.updatedAt).toLocaleDateString()}</p>
-                  </div>
-                ))
-              )}
-            </div>
+            {renderDocumentSidebar(false)}
           </div>
 
           {/* Center: Editor */}
           <div className="flex-1 bg-white flex flex-col relative overflow-hidden">
-            {editingDocId ? (
-              <div className="flex flex-col h-full absolute inset-0">
-                <div className="px-12 pt-8 pb-4 shrink-0 flex items-center justify-between border-b border-slate-100">
-                  <input 
-                    className="text-3xl font-display font-semibold text-slate-900 bg-transparent border-none focus:ring-0 p-0 placeholder:text-slate-300 outline-none flex-1 min-w-0"
-                    value={documents.find(d => d.id === editingDocId)?.title || ""}
-                    placeholder="Untitled Document"
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      setDocuments(prev => prev.map(d => d.id === editingDocId ? { ...d, title: val } : d));
-                    }}
-                  />
-                  <div className="flex items-center gap-1 shrink-0 ml-4">
-                    <button 
-                      onClick={() => handleDownloadDoc(editingDocId)}
-                      className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors flex items-center gap-1.5 text-sm font-medium"
-                      title="Download as HTML"
-                    >
-                      <Download size={16} />
-                      <span className="hidden sm:inline">Download</span>
-                    </button>
-                    <button 
-                      onClick={() => handleShareDoc(editingDocId)}
-                      className="p-2 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors flex items-center gap-1.5 text-sm font-medium"
-                      title="Share or Copy text"
-                    >
-                      <Share2 size={16} />
-                      <span className="hidden sm:inline">Share</span>
-                    </button>
-                  </div>
-                </div>
-                <div className="flex-1 overflow-y-auto p-4 px-12">
-                  <div className="max-w-4xl mx-auto h-full pb-32">
-                    <ReactQuill 
-                      theme="snow"
-                      value={documents.find(d => d.id === editingDocId)?.content || ""}
-                      onChange={(val) => handleUpdateDocContent(editingDocId, val)}
-                      placeholder="Start drafting here..."
-                      modules={{
-                        toolbar: [
-                          [{'header': [1, 2, 3, false]}],
-                          ['bold', 'italic', 'underline', 'strike'],
-                          [{'list': 'ordered'}, {'list': 'bullet'}],
-                          [{'align': []}],
-                          ['clean']
-                        ]
-                      }}
-                      className="h-full rounded-xl border border-transparent transition-colors [&_.ql-toolbar]:border-none [&_.ql-toolbar]:bg-slate-50 [&_.ql-toolbar]:rounded-t-xl [&_.ql-container]:border-none [&_.ql-container]:text-[15px] [&_.ql-editor]:min-h-[400px] [&_.ql-editor]:font-sans [&_.ql-editor]:text-slate-800 [&_.ql-blank::before]:text-slate-300"
-                    />
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="h-full flex flex-col items-center justify-center text-slate-300">
-                <FileText size={48} className="opacity-30 mb-4" />
-                <p className="text-sm font-medium">Select a document from the library to edit.</p>
-              </div>
-            )}
+            {renderDocumentEditor()}
           </div>
 
           {/* Right Sidebar: Intel & Notepad */}
@@ -943,114 +1327,12 @@ export default function App() {
               <div className="flex-1 flex overflow-hidden">
                 {/* Left Sidebar: Library */}
                 <div className="w-64 border-r border-slate-200 bg-slate-50 flex flex-col shrink-0">
-                  <div className="p-4 border-b border-slate-200">
-                    <button 
-                      onClick={() => {
-                        const newDoc: MUNDocument = {
-                          id: Date.now().toString(),
-                          title: "Untitled Document",
-                          type: "other",
-                          content: "",
-                          updatedAt: Date.now()
-                        };
-                        setDocuments(prev => [newDoc, ...prev]);
-                        setEditingDocId(newDoc.id);
-                      }}
-                      className="w-full bg-blue-600 hover:bg-blue-700 text-white p-2.5 rounded-lg flex items-center justify-center gap-2 transition-all shadow-sm"
-                    >
-                      <Plus size={16} />
-                      <span className="text-sm font-medium">New Document</span>
-                    </button>
-                  </div>
-                  <div className="flex-1 overflow-y-auto p-3 space-y-2">
-                    {documents.length === 0 ? (
-                      <p className="text-xs text-center text-slate-400 mt-4">Library is empty.</p>
-                    ) : (
-                      documents.map(doc => (
-                        <div 
-                          key={doc.id}
-                          onClick={() => setEditingDocId(doc.id)}
-                          className={cn(
-                            "p-3 rounded-xl cursor-pointer transition-all border group",
-                            editingDocId === doc.id ? "bg-white shadow-sm border-blue-200" : "bg-transparent border-transparent hover:bg-white hover:border-slate-200"
-                          )}
-                        >
-                          <div className="flex items-start justify-between gap-2">
-                            <h4 className={cn("text-sm font-medium truncate", editingDocId === doc.id ? "text-blue-700" : "text-slate-700")}>{doc.title}</h4>
-                            <button 
-                              onClick={(e) => handleDeleteDoc(doc.id, e)}
-                              className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-500 transition-opacity"
-                            >
-                              <Trash2 size={14} />
-                            </button>
-                          </div>
-                          <p className="text-[10px] text-slate-400 mt-1">{new Date(doc.updatedAt).toLocaleDateString()}</p>
-                        </div>
-                      ))
-                    )}
-                  </div>
+                  {renderDocumentSidebar(true)}
                 </div>
 
                 {/* Right: Editor */}
                 <div className="flex-1 bg-white overflow-hidden flex flex-col relative">
-                  {editingDocId ? (
-                    <div className="flex flex-col h-full absolute inset-0">
-                      <div className="px-12 pt-10 pb-4 shrink-0 flex items-center justify-between border-b border-slate-100">
-                        <input 
-                          className="text-3xl font-display font-semibold text-slate-900 bg-transparent border-none focus:ring-0 p-0 placeholder:text-slate-300 flex-1 min-w-0"
-                          value={documents.find(d => d.id === editingDocId)?.title || ""}
-                          placeholder="Untitled Document"
-                          onChange={(e) => {
-                            const val = e.target.value;
-                            setDocuments(prev => prev.map(d => d.id === editingDocId ? { ...d, title: val } : d));
-                          }}
-                        />
-                        <div className="flex items-center gap-1 shrink-0 ml-4">
-                          <button 
-                            onClick={() => handleDownloadDoc(editingDocId)}
-                            className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors flex items-center gap-1.5 text-sm font-medium"
-                            title="Download as HTML"
-                          >
-                            <Download size={16} />
-                            <span className="hidden sm:inline">Download</span>
-                          </button>
-                          <button 
-                            onClick={() => handleShareDoc(editingDocId)}
-                            className="p-2 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors flex items-center gap-1.5 text-sm font-medium"
-                            title="Share or Copy text"
-                          >
-                            <Share2 size={16} />
-                            <span className="hidden sm:inline">Share</span>
-                          </button>
-                        </div>
-                      </div>
-                      <div className="flex-1 overflow-y-auto p-4 px-12">
-                        <div className="max-w-4xl mx-auto h-full pb-32">
-                          <ReactQuill 
-                            theme="snow"
-                            value={documents.find(d => d.id === editingDocId)?.content || ""}
-                            onChange={(val) => handleUpdateDocContent(editingDocId, val)}
-                            placeholder="Start drafting here... Remember, AI is not allowed during debate."
-                            modules={{
-                              toolbar: [
-                                [{'header': [1, 2, 3, false]}],
-                                ['bold', 'italic', 'underline', 'strike'],
-                                [{'list': 'ordered'}, {'list': 'bullet'}],
-                                [{'align': []}],
-                                ['clean']
-                              ]
-                            }}
-                            className="h-full rounded-xl border border-transparent hover:border-slate-100 transition-colors [&_.ql-toolbar]:border-none [&_.ql-toolbar]:bg-slate-50 [&_.ql-toolbar]:rounded-t-xl [&_.ql-container]:border-none [&_.ql-container]:text-[15px] [&_.ql-editor]:min-h-[400px] [&_.ql-editor]:font-sans [&_.ql-editor]:text-slate-800"
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="h-full flex flex-col items-center justify-center text-slate-400">
-                      <FileText size={48} className="opacity-20 mb-4" />
-                      <p className="text-sm font-medium">Select a document from the library to edit.</p>
-                    </div>
-                  )}
+                  {renderDocumentEditor()}
                 </div>
               </div>
             </motion.div>
